@@ -26,7 +26,6 @@ result is saved to docs/campus_grid_demo.png.
 """
 
 import argparse
-import heapq
 import json
 import sys
 import time
@@ -390,80 +389,18 @@ def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0
 
     Returns:
         route: (N, 2) array of (x, y) points in meters, step_m apart
+
+    The search itself lives in planners/astar.py, on the shared problem
+    definition in planners/problem.py.
     """
-    prep = _prepare(grid, step_m, elevation, elev_res, smooth_m, max_grade)
-    main, z, edge, res_c = prep['main'], prep['z'], prep['edge'], prep['res_c']
-    Hc, Wc = main.shape
-    if elevation is None:
-        climb_weight = descent_weight = 0.0
-    rr, cc = np.nonzero(main)
-
-    def nearest(xy):
-        d = (cc * res_c + res_c / 2 - xy[0]) ** 2 + (rr * res_c + res_c / 2 - xy[1]) ** 2
-        i = np.argmin(d)
-        return int(rr[i]), int(cc[i])
-
-    s, g = nearest(start_xy), nearest(goal_xy)
-    zg = z[g]
-
-    blocked = None
-    if obstacles is not None and len(obstacles):
-        blocked = np.zeros((Hc, Wc), dtype=bool)
-        reach = int(np.ceil(obstacle_radius / res_c))
-        for ox, oy in np.atleast_2d(obstacles):
-            c0, r0 = int(ox / res_c), int(oy / res_c)
-            for r in range(max(r0 - reach, 0), min(r0 + reach + 1, Hc)):
-                for c in range(max(c0 - reach, 0), min(c0 + reach + 1, Wc)):
-                    if np.hypot(c * res_c + res_c / 2 - ox,
-                                r * res_c + res_c / 2 - oy) < obstacle_radius:
-                        blocked[r, c] = True
-        blocked[s] = blocked[g] = False   # never block where we are or where we go
-    sqrt2 = np.sqrt(2.0)
-
-    def heuristic(cell):
-        dr, dc = abs(g[0] - cell[0]), abs(g[1] - cell[1])
-        octile = (max(dr, dc) + (sqrt2 - 1.0) * min(dr, dc)) * res_c
-        return octile + climb_weight * max(0.0, zg - z[cell])
-
-    cost = {s: 0.0}
-    came = {s: None}
-    queue = [(heuristic(s), s)]
-    closed = set()
-    while queue:
-        _, cur = heapq.heappop(queue)
-        if cur == g:
-            break
-        if cur in closed:
-            continue
-        closed.add(cur)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                nb = (cur[0] + dr, cur[1] + dc)
-                if not ((dr or dc) and 0 <= nb[0] < Hc and 0 <= nb[1] < Wc and main[nb]):
-                    continue
-                if blocked is not None and blocked[nb]:
-                    continue
-                L = (sqrt2 if dr and dc else 1.0) * res_c
-                dz = z[nb] - z[cur]
-                grade = abs(dz) / L
-                if grade > max_grade:
-                    continue
-                step = (L * (1.0 + edge[nb])
-                        + L * STEEP_WEIGHT * max(0.0, grade - RAMP_GRADE) * (elevation is not None)
-                        + climb_weight * max(dz, 0.0) + descent_weight * max(-dz, 0.0))
-                c = cost[cur] + step
-                if c < cost.get(nb, np.inf):
-                    cost[nb] = c
-                    came[nb] = cur
-                    heapq.heappush(queue, (c + heuristic(nb), nb))
-    if g not in came:  # only possible when obstacles close off every way through
-        raise RuntimeError('No sidewalk route between start and goal')
-
-    cells = [g]
-    while came[cells[-1]] is not None:
-        cells.append(came[cells[-1]])
-    cells = np.array(cells[::-1], dtype=float)
-    return cells[:, ::-1] * res_c + res_c / 2
+    from planners.astar import astar
+    from planners.problem import PlanningProblem
+    problem = PlanningProblem(grid, start_xy, goal_xy, elevation=elevation, elev_res=elev_res,
+                              obstacles=obstacles, obstacle_radius=obstacle_radius,
+                              step_m=step_m, climb_weight=climb_weight,
+                              descent_weight=descent_weight, max_grade=max_grade,
+                              smooth_m=smooth_m)
+    return astar(problem)
 
 
 def route_profile(route, elevation, elev_res, smooth_m=SMOOTH_M):

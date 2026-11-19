@@ -5,8 +5,12 @@ robot looks for pedestrians within its sensor range, and the baseline
 controller decides what to do:
 
 - If a pedestrian it can see is on its path ahead, it replans the A* route
-  around them (pedestrians become temporary obstacles).
-- If someone is right in front of it anyway, it stops and waits.
+  around every pedestrian it remembers (pedestrians become temporary
+  obstacles). It remembers people standing still until it sees them
+  elsewhere, and people walking for MEMORY_MOVING seconds, so it does not
+  forget someone it has just passed and switch back to a route they block.
+- If someone is in its lane closer than its stopping distance (v^2 / 2a plus
+  room for both bodies), it brakes and waits.
 - Otherwise it drives at up to V_MAX, with acceleration limited to A_MAX.
 
 Metrics are printed and the run is saved as an animation that follows the
@@ -35,8 +39,10 @@ A_MAX = 0.5              # robot acceleration / braking limit (m/s^2)
 ROBOT_RADIUS = 0.35      # m (0.7 m across, about a sidewalk delivery robot)
 SENSOR_RANGE = 8.0       # robot sees pedestrians this far away (m)
 PASS_CLEARANCE = ROBOT_RADIUS + PED_RADIUS + 0.3   # center-to-center when passing (m)
-STOP_DISTANCE = ROBOT_RADIUS + PED_RADIUS + 0.4    # stop if someone this close ahead (m)
+STOP_MARGIN = 0.2        # room left between robot and person after braking (m)
 REPLAN_EVERY = 1.0       # replan at most this often (s)
+MEMORY_MOVING = 3.0      # remember a walking person this long after last seeing them (s)
+STILL_SPEED = 0.2        # someone slower than this (m/s) counts as standing still
 NEAR_MISS = 0.2          # gap between robot and person counted as a near-miss (m)
 
 
@@ -46,6 +52,12 @@ def _arc(path):
 
 def _at(path, arc, s):
     return np.array([np.interp(s, arc, path[:, 0]), np.interp(s, arc, path[:, 1])])
+
+
+def stopping_distance(v):
+    """Center-to-center distance at which the robot must start braking for a
+    person in its lane: braking distance v^2 / (2 A_MAX), both bodies, a margin."""
+    return v * v / (2.0 * A_MAX) + ROBOT_RADIUS + PED_RADIUS + STOP_MARGIN
 
 
 def run(gt, elev, elev_res, route, goal_xy, crowd, max_time=None, record_every=2.0):
@@ -67,6 +79,10 @@ def run(gt, elev, elev_res, route, goal_xy, crowd, max_time=None, record_every=2
     frames, trail = [], [path[0].copy()]
     next_frame = 0.0
     status = 'driving'
+    # What the robot remembers about each person it has seen
+    known_pos = np.zeros((len(crowd), 2))
+    known_t = np.full(len(crowd), -np.inf)
+    known_moving = np.zeros(len(crowd), dtype=bool)
 
     while t < max_time:
         crowd.step(DT)
@@ -80,7 +96,17 @@ def run(gt, elev, elev_res, route, goal_xy, crowd, max_time=None, record_every=2
         dist = np.linalg.norm(rel, axis=1)
         seen = dist < SENSOR_RANGE
 
-        # Is a seen pedestrian on the path ahead? Then plan around them.
+        # Update memory: where each seen person is, and whether they are walking
+        idx = np.flatnonzero(seen)
+        before = np.isfinite(known_t[idx])
+        moved = np.linalg.norm(crowd.pos[idx] - known_pos[idx], axis=1)
+        speed_seen = moved / np.maximum(t - known_t[idx], DT)
+        known_moving[idx] = before & (speed_seen > STILL_SPEED)
+        known_pos[idx] = crowd.pos[idx]
+        known_t[idx] = t
+        remembered = np.isfinite(known_t) & (~known_moving | (t - known_t < MEMORY_MOVING))
+
+        # Is a seen pedestrian on the path ahead? Then plan around everyone remembered.
         ahead = path[(arc >= s) & (arc <= ahead_end)]
         conflict = False
         if seen.any() and len(ahead):
@@ -90,7 +116,8 @@ def run(gt, elev, elev_res, route, goal_xy, crowd, max_time=None, record_every=2
             last_replan = t
             try:
                 new = cg.plan_route(gt, pos, goal_xy, elevation=elev, elev_res=elev_res,
-                                    obstacles=crowd.pos[seen], obstacle_radius=PASS_CLEARANCE)
+                                    obstacles=known_pos[remembered],
+                                    obstacle_radius=PASS_CLEARANCE)
                 path = np.vstack([pos, new])
                 arc = _arc(path)
                 s = 0.0
@@ -98,8 +125,11 @@ def run(gt, elev, elev_res, route, goal_xy, crowd, max_time=None, record_every=2
             except RuntimeError:
                 m['replan_failures'] += 1          # no way past: wait for now
 
-        # Stop for anyone right in front of the robot
-        in_front = (dist < STOP_DISTANCE) & (rel @ heading > 0.0)
+        # Brake for anyone in the robot's lane within its stopping distance
+        along = rel @ heading
+        across = np.abs(rel[:, 0] * heading[1] - rel[:, 1] * heading[0])
+        in_lane = across < ROBOT_RADIUS + PED_RADIUS + 0.1
+        in_front = in_lane & (along > 0.0) & (along < stopping_distance(v))
         blocked = bool(in_front.any())
         v_target = 0.0 if blocked else V_MAX
         v = float(np.clip(v_target, v - A_MAX * DT, v + A_MAX * DT))
@@ -318,7 +348,9 @@ def simulate(pickup, dropoff, n_peds=20, ped_speed=0.0, floor=None, from_floor=N
         print(f"  Delivered in {m['time_s']:.0f} s, driving {m['driven_m']:.0f} m "
               f"(average {m['driven_m'] / m['time_s']:.2f} m/s)")
     else:
-        print(f"  Did NOT arrive within {m['time_s']:.0f} s: people blocked the way "
+        why = ('people blocked every way past' if m['replan_failures']
+               else 'ran out of time')
+        print(f"  Did NOT arrive within {m['time_s']:.0f} s: {why} "
               f"({m['driven_m']:.0f} m driven)")
     print(f"  Stopped for {m['stopped_s']:.0f} s; replanned around people {m['replans']} times"
           + (f" ({m['replan_failures']} times there was no way past)"

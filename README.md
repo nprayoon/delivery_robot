@@ -13,6 +13,7 @@ mapping with the Assignment 2 occupancy-grid code.
 |---|---|
 | `make_campus_map.py` | Builds the campus map: downloads OpenStreetMap paths, buildings and entrances plus USGS elevation, removes stairs, finds each building's delivery points and their floors. Writes `maps/`. |
 | `campus_grid.py` | Loads the map into the Assignment 2 `Grid2D`, plans routes with A* (slope and climb aware), and runs a demo delivery that maps the route with the Assignment 2 Mapper. |
+| `planners/` | Route planning: `problem.py` (map, start, goal, rules, costs) and `astar.py` (A*). See `planners/README.md`. |
 | `pedestrians.py` | Simulated pedestrians on the sidewalks near the route (standing still by default, or walking trips; they may use stairs and do not react to the robot). |
 | `simulate.py` | Runs a delivery among pedestrians: the robot replans around people it sees (8 m sensor) and stops if someone is right in front. Prints metrics and saves two animations, `docs/simulation_follow.gif` (zoomed in on the robot) and `docs/simulation_map.gif` (whole campus map), plus `docs/simulation.png`. |
 | `test_campus_grid.py`, `test_campus_map.py`, `test_simulate.py` | Checks the map, entrances, stairs, slopes, routes and the simulation. |
