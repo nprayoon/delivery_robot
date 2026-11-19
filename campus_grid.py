@@ -353,7 +353,7 @@ def smooth_elevation(elevation, elev_res, smooth_m=SMOOTH_M):
 
 def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0,
                climb_weight=CLIMB_WEIGHT, descent_weight=DESCENT_WEIGHT,
-               max_grade=MAX_GRADE, smooth_m=SMOOTH_M):
+               max_grade=MAX_GRADE, smooth_m=SMOOTH_M, obstacles=None, obstacle_radius=0.8):
     """A* along the sidewalks from start to goal.
 
     Plans on a coarser copy of the grid (step_m per cell) to stay fast, on the
@@ -379,6 +379,10 @@ def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0
     possible 8-connected path, and any route must climb at least the net height
     gain, so h never overestimates the remaining cost.
 
+    obstacles: optional (K, 2) points (e.g. pedestrians) the route must keep
+    obstacle_radius meters away from, measured center to center. They are
+    temporary: they block the route but are not part of the map.
+
     Start and goal snap to the nearest cell the robot can drive to: the largest
     connected piece of sidewalk, joined only by steps within the grade limit.
     route[0] and route[-1] show where that is; compare them with start_xy and
@@ -401,6 +405,19 @@ def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0
 
     s, g = nearest(start_xy), nearest(goal_xy)
     zg = z[g]
+
+    blocked = None
+    if obstacles is not None and len(obstacles):
+        blocked = np.zeros((Hc, Wc), dtype=bool)
+        reach = int(np.ceil(obstacle_radius / res_c))
+        for ox, oy in np.atleast_2d(obstacles):
+            c0, r0 = int(ox / res_c), int(oy / res_c)
+            for r in range(max(r0 - reach, 0), min(r0 + reach + 1, Hc)):
+                for c in range(max(c0 - reach, 0), min(c0 + reach + 1, Wc)):
+                    if np.hypot(c * res_c + res_c / 2 - ox,
+                                r * res_c + res_c / 2 - oy) < obstacle_radius:
+                        blocked[r, c] = True
+        blocked[s] = blocked[g] = False   # never block where we are or where we go
     sqrt2 = np.sqrt(2.0)
 
     def heuristic(cell):
@@ -424,6 +441,8 @@ def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0
                 nb = (cur[0] + dr, cur[1] + dc)
                 if not ((dr or dc) and 0 <= nb[0] < Hc and 0 <= nb[1] < Wc and main[nb]):
                     continue
+                if blocked is not None and blocked[nb]:
+                    continue
                 L = (sqrt2 if dr and dc else 1.0) * res_c
                 dz = z[nb] - z[cur]
                 grade = abs(dz) / L
@@ -437,7 +456,7 @@ def plan_route(grid, start_xy, goal_xy, step_m=0.5, elevation=None, elev_res=1.0
                     cost[nb] = c
                     came[nb] = cur
                     heapq.heappush(queue, (c + heuristic(nb), nb))
-    if g not in came:  # cannot happen: s and g are in the same connected piece
+    if g not in came:  # only possible when obstacles close off every way through
         raise RuntimeError('No sidewalk route between start and goal')
 
     cells = [g]
@@ -483,8 +502,29 @@ def demo(png_path=DEFAULT_MAP, pickup='Cohon University Center', dropoff='Baker 
     entrances = load_entrances(png_path)
     if not entrances:
         raise SystemExit('This map has no entrances saved; rerun make_campus_map.py')
-    # Leave by the pickup door nearest the destination, arrive by the nearest door
     elev, elev_res = load_elevation(png_path)
+    plan = plan_delivery(gt, entrances, elev, elev_res, pickup, dropoff,
+                         floor=floor, from_floor=from_floor)
+    start, goal, route = plan['start'], plan['goal'], plan['route']
+    floor, floor_gap = plan['floor'], plan['floor_gap']
+    seg = np.r_[0, np.cumsum(np.linalg.norm(np.diff(route, axis=0), axis=1))]
+    _demo_rest(gt, png_path, entrances, elev, elev_res, start, goal, route, seg,
+               floor, floor_gap, out)
+
+
+def plan_delivery(gt, entrances, elev, elev_res, pickup, dropoff, floor=None,
+                  from_floor=None, verbose=True):
+    """Choose the pickup and drop-off doors and plan the robot's route.
+
+    Leaves by the pickup door nearest the destination and arrives by the
+    drop-off door nearest the start, honouring the requested floors where the
+    robot can reach a door on them. With verbose, prints what was chosen.
+
+    Returns a dict with 'start' and 'goal' (entrance records), 'route' ((N, 2)
+    meters), 'floor' (the requested drop-off floor, normalized) and
+    'floor_gap' (floors between the requested and the delivered floor).
+    """
+    say = print if verbose else (lambda *a, **k: None)
 
     def hard(e):  # a door on ground too steep to drive up to
         return drivable_gap(gt, e['delivery_xy'], elev, elev_res) > 2.0
@@ -493,14 +533,14 @@ def demo(png_path=DEFAULT_MAP, pickup='Cohon University Center', dropoff='Baker 
     start = find_entrance(entrances, pickup, near_xy=dest, floor=from_floor, hard=hard)
     goal = find_entrance(entrances, dropoff, near_xy=start['delivery_xy'], floor=floor,
                          hard=hard)
-    print(f"Delivery: {start['building']} -> {goal['building']} "
+    say(f"Delivery: {start['building']} -> {goal['building']} "
           f"({goal['entrance']} entrance, {goal['source']})")
-    print(f"  Picks up at {start['building']}, {floor_text(start) or 'floor unknown'}")
-    print(f"  Delivers to {goal['building']}, {floor_text(goal) or 'floor unknown'}")
+    say(f"  Picks up at {start['building']}, {floor_text(start) or 'floor unknown'}")
+    say(f"  Delivers to {goal['building']}, {floor_text(goal) or 'floor unknown'}")
     if from_floor is not None and start.get('floor_index') is not None:
         gap = abs(start['floor_index'] - floor_index(start, from_floor))
         if gap:
-            print(f"  No pickup door on floor {str(from_floor).upper()} the robot can use; "
+            say(f"  No pickup door on floor {str(from_floor).upper()} the robot can use; "
                   f"picking up on floor {start['floor']}, {gap} floor(s) away by elevator")
     floor_gap = None
     if floor is not None and goal.get('floor_index') is not None:
@@ -515,7 +555,7 @@ def demo(png_path=DEFAULT_MAP, pickup='Cohon University Center', dropoff='Baker 
         usable = list(dict.fromkeys(names([e for e in mine
                                            if not e.get('curbside') and not hard(e)])))
         unusable = [f for f in dict.fromkeys(names(mine)) if f not in usable]
-        print(f"  No entrance on floor {floor} the robot can use. Usable doors are on floor"
+        say(f"  No entrance on floor {floor} the robot can use. Usable doors are on floor"
               f"{'s' if len(usable) > 1 else ''} {', '.join(usable)}"
               + (f" (doors on floor {', '.join(unusable)} need stairs or are on "
                  f"ground too steep to drive)" if unusable else '')
@@ -523,21 +563,36 @@ def demo(png_path=DEFAULT_MAP, pickup='Cohon University Center', dropoff='Baker 
               f"{floor_gap} floor(s) need an elevator")
     for e, role in ((start, 'Pickup'), (goal, 'Drop-off')):
         if e.get('curbside'):
-            print(f"  {role} door at {e['building']} is reachable only by stairs (or is cut "
+            say(f"  {role} door at {e['building']} is reachable only by stairs (or is cut "
                   f"off), so the robot stops curbside, {e['curbside_m']:.0f} m from it")
 
     t0 = time.perf_counter()
     route = plan_route(gt, start['delivery_xy'], goal['delivery_xy'],
                        elevation=elev, elev_res=elev_res)
     t_plan = time.perf_counter() - t0
-    seg = np.r_[0, np.cumsum(np.linalg.norm(np.diff(route, axis=0), axis=1))]
     miss = np.hypot(*(route[-1] - np.array(goal['delivery_xy'])))
-    print(f'Planned with A* in {t_plan:.1f} s; the route ends {miss:.2f} m from the drop-off point')
+    say(f'Planned with A* in {t_plan:.1f} s; the route ends {miss:.2f} m from the drop-off point')
     for e, end, role in ((start, route[0], 'pickup'), (goal, route[-1], 'drop-off')):
         gap = np.hypot(*(end - np.array(e['delivery_xy'])))
         if gap > 2.0:
-            print(f"  Note: the {role} point at {e['building']} is on ground steeper than "
+            say(f"  Note: the {role} point at {e['building']} is on ground steeper than "
                   f'{MAX_GRADE:.0%}; the closest place the robot can drive to is {gap:.0f} m away')
+    return {'start': start, 'goal': goal, 'route': route, 'floor': floor,
+            'floor_gap': floor_gap}
+
+
+def _demo_rest(gt, png_path, entrances, elev, elev_res, start, goal, route, seg,
+               floor, floor_gap, out):
+    """The demo after planning: compare with a slope-blind route, map the drive
+    with the Assignment 2 Mapper, and draw the figure."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, Rectangle
+
+    res = gt.resolution
+    W_m, H_m = gt.width * res, gt.height * res
+    free = free_mask(gt)
     flat = None
     if elev is not None:
         # Same planner ignoring elevation, to show what the terrain changes
