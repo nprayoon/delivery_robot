@@ -28,7 +28,7 @@ import numpy as np
 import osmnx as ox
 from PIL import Image, ImageDraw
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
-from shapely.ops import nearest_points, unary_union
+from shapely.ops import linemerge, nearest_points, unary_union
 from shapely.prepared import prep
 
 # Center of the default crop: CMU Pittsburgh campus, sized to take in Hunt Library
@@ -605,6 +605,61 @@ def is_steps(row):
             and not _has(row.get('ramp:wheelchair'), {'yes'}))
 
 
+def is_bridge(row):
+    """A path on a bridge (bridge=yes, viaduct, ...), not on the ground below."""
+    value = row.get('bridge')
+    values = value if isinstance(value, list) else [value]
+    return any(isinstance(v, str) and v not in ('no', '') for v in values)
+
+
+def flatten_bridges(elev, dem_res, paths, origin, height_m, deck_m=6.0, end_m=3.0):
+    """Put the elevation of bridge decks into the terrain.
+
+    USGS 3DEP is bare earth: under a bridge it holds the valley floor (about
+    15 m below Forbes Ave over Junction Hollow), so a bridge looks like a cliff
+    and the robot could never cross it. Each bridge (its OSM ways merged into
+    whole spans) gets a straight ramp between the ground at its two ends,
+    burned deck_m wide. Returns the number of spans.
+    """
+    lines = [g for g in paths[paths.apply(is_bridge, axis=1)].geometry
+             if g is not None and not g.is_empty]
+    if not lines:
+        return 0
+    merged = linemerge(unary_union(lines))
+    spans = list(merged.geoms) if hasattr(merged, 'geoms') else [merged]
+    H, W = elev.shape
+    ground = elev.copy()       # read end heights from the unmodified terrain
+    reach = int(np.ceil(deck_m / 2 / dem_res))
+    ends_r = int(np.ceil(end_m / dem_res))
+
+    def cell(x, y):
+        return (int((height_m - (y - origin[1])) / dem_res), int((x - origin[0]) / dem_res))
+
+    def end_height(pt):
+        r, c = cell(*pt)
+        if not (0 <= r < H and 0 <= c < W):
+            return None            # this end is off the map
+        win = ground[max(r - ends_r, 0):r + ends_r + 1, max(c - ends_r, 0):c + ends_r + 1]
+        return float(np.median(win)) if win.size else None
+
+    count = 0
+    for span in spans:
+        coords = list(span.coords)
+        z0, z1 = end_height(coords[0]), end_height(coords[-1])
+        if z0 is None or z1 is None or span.length < 1.0:
+            continue
+        count += 1
+        for d in np.arange(0.0, span.length + 0.25, 0.5):
+            pt = span.interpolate(min(d, span.length))
+            z = z0 + (z1 - z0) * min(d, span.length) / span.length
+            r, c = cell(pt.x, pt.y)
+            if not (0 <= r < H and 0 <= c < W):
+                continue           # off the map (negative indices would wrap around)
+            elev[max(r - reach, 0):min(r + reach + 1, H),
+                 max(c - reach, 0):min(c + reach + 1, W)] = z
+    return count
+
+
 def beside_stairs(paths, steps, min_offset=0.8, max_offset=4.0, min_cos=0.85):
     """Paths that run alongside a staircase, like a ramp next to the steps.
 
@@ -753,9 +808,12 @@ def main():
                               res_m=args.elevation_res)
     print(f'Elevation: {elev.min():.1f} to {elev.max():.1f} m '
           f'({elev.max() - elev.min():.1f} m of relief) from USGS 3DEP')
+    ground = elev.copy()     # bare earth, for building floors
+    spans = flatten_bridges(elev, args.elevation_res, paths, origin, args.height_m)
+    print(f'Bridges: {spans} spans set to deck height (the terrain data is the ground below)')
 
     doors = find_entrances(buildings, entrances, paths, origin, args.width_m, args.height_m,
-                           elev=elev, dem_res=args.elevation_res)
+                           elev=ground, dem_res=args.elevation_res)
     plans = load_floor_plans()
     unmatched = apply_floor_overrides(doors, origin)
     calibration = name_floors(doors, plans)
